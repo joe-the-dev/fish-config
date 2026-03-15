@@ -222,6 +222,19 @@ function nv --description 'Set global Node.js version with asdf'
     end
 end
 
+function pv --description 'Set global pnpm version with asdf: pv [version]'
+    if test (count $argv) -eq 0
+        echo "Current pnpm version: "(pnpm -v)
+        echo "Available versions:"
+        asdf list pnpm
+    else
+        asdf install pnpm $argv[1]
+        asdf set -u pnpm $argv[1]
+        asdf reshim pnpm
+        echo "Switched to pnpm version: "(pnpm -v)
+    end
+end
+
 # Per-directory history management
 set -g fish_history_dir ~/.local/share/fish/history_dirs
 
@@ -230,7 +243,7 @@ function __update_history_file --on-variable PWD --description 'Switch history f
     test -d $fish_history_dir; or mkdir -p $fish_history_dir
 
     # Create a hash of the current directory path, replacing invalid characters
-    set -l dir_hash (string replace -a / _ (pwd) | string replace -a . _ | string sub -s 2)
+    set -l dir_hash (string replace -a / _ (pwd) | string replace -a . _ | string replace -a - _ | string sub -s 2)
     set -l history_name "dir$dir_hash"
 
     # Switch to this directory's history
@@ -267,3 +280,311 @@ end
 function ports --description 'Show listening ports'
     sudo lsof -iTCP -sTCP:LISTEN -n -P
 end
+
+function fixnpm --description 'Fix node-toolbox SSH issue and run npm install: fixnpm [path] [--profile personal|work] [--clean]'
+    # Defaults
+    set -l target_dir (pwd)
+    set -l profile ""       # auto-detect if not specified
+    set -l do_clean 0
+
+    # Parse arguments
+    set -l i 1
+    while test $i -le (count $argv)
+        switch $argv[$i]
+            case --profile
+                set i (math $i + 1)
+                set profile $argv[$i]
+            case --clean
+                set do_clean 1
+            case '*'
+                set target_dir (realpath $argv[$i])
+        end
+        set i (math $i + 1)
+    end
+
+    if not test -f "$target_dir/package.json"
+        echo "✗ No package.json found in: $target_dir"
+        return 1
+    end
+
+    echo "→ Target: $target_dir"
+
+    # Auto-detect profile from current git URL rewrite if not specified
+    if test -z "$profile"
+        set -l rewrite (git config --global --get "url.git@github-work:holidayextras/.insteadof" 2>/dev/null)
+        if test -n "$rewrite"
+            set profile work
+            echo "→ Profile: work (auto-detected from git URL rewrite)"
+        else
+            set profile personal
+            echo "→ Profile: personal (auto-detected, no work rewrite active)"
+        end
+    else
+        echo "→ Profile: $profile"
+    end
+
+    switch $profile
+        case work
+            # Ensure work git URL rewrite is active
+            set -l rewrite (git config --global --get "url.git@github-work:holidayextras/.insteadof" 2>/dev/null)
+            if test -z "$rewrite"
+                echo "⚠ Work git URL rewrite not active — applying now..."
+                git config --global url."git@github-work:holidayextras/".insteadOf "ssh://git@github.com/holidayextras/"
+                git config --global url."git@github-work:holidayextras/".insteadOf "git@github.com:holidayextras/"
+                echo "✓ Git URL rewrite applied (github.com/holidayextras → github-work)"
+            else
+                echo "✓ Git URL rewrite already active"
+            end
+
+            # Verify SSH access
+            set -l ssh_check (ssh -T git@github-work 2>&1 | string match -rg 'Hi (\S+)!')
+            if test -z "$ssh_check"
+                echo "✗ Work SSH key auth failed — run: ghswitch work"
+                return 1
+            end
+            echo "✓ SSH authenticated as: $ssh_check (work)"
+
+        case personal
+            # Remove work rewrite rules so personal key is used
+            git config --global --unset "url.git@github-work:holidayextras/.insteadof" 2>/dev/null
+            echo "✓ Using personal GitHub credentials"
+
+            # Verify SSH access
+            set -l ssh_check (ssh -T git@github-personal 2>&1 | string match -rg 'Hi (\S+)!')
+            if test -z "$ssh_check"
+                echo "⚠ Personal SSH key auth check failed — continuing anyway"
+            else
+                echo "✓ SSH authenticated as: $ssh_check (personal)"
+            end
+
+        case '*'
+            echo "✗ Unknown profile: $profile (use 'personal' or 'work')"
+            return 1
+    end
+
+    # Clean node_modules and lock file for a fresh install
+    if test $do_clean -eq 1
+        echo "→ Cleaning node_modules and package-lock.json..."
+        rm -rf "$target_dir/node_modules" "$target_dir/package-lock.json"
+    end
+
+    # Run npm install
+    echo "→ Running npm install..."
+    cd $target_dir && npm install
+    set -l npm_status $status
+    if test $npm_status -eq 0
+        echo "✓ npm install completed successfully"
+    else
+        echo "✗ npm install failed (exit $npm_status)"
+        return $npm_status
+    end
+end
+
+function fixnpm_all --description 'Run fixnpm on all repos with node-toolbox in a directory: fixnpm_all [base_dir] [--profile personal|work] [--clean]'
+    set -l base_dir (pwd)
+    set -l extra_flags
+
+    # Parse arguments
+    set -l i 1
+    while test $i -le (count $argv)
+        switch $argv[$i]
+            case --profile
+                set i (math $i + 1)
+                set extra_flags $extra_flags --profile $argv[$i]
+            case --clean
+                set extra_flags $extra_flags --clean
+            case '*'
+                set base_dir (realpath $argv[$i])
+        end
+        set i (math $i + 1)
+    end
+
+    echo "→ Scanning repos in: $base_dir"
+
+    set -l fixed 0
+    set -l skipped 0
+    set -l failed 0
+
+    for pkg in $base_dir/*/package.json
+        set -l repo_dir (dirname $pkg)
+        set -l repo_name (basename $repo_dir)
+
+        if grep -q "node-toolbox" $pkg 2>/dev/null
+            echo ""
+            echo "══ $repo_name ══"
+            fixnpm $repo_dir $extra_flags
+            if test $status -eq 0
+                set fixed (math $fixed + 1)
+            else
+                set failed (math $failed + 1)
+            end
+        else
+            set skipped (math $skipped + 1)
+        end
+    end
+
+    echo ""
+    echo "══════════════════════════════"
+    echo "  Done — fixed: $fixed | failed: $failed | skipped (no toolbox): $skipped"
+end
+
+# Git profile switcher for a directory of repos
+function gitprofile --description 'Switch git user.name/email for all repos in a dir: gitprofile [personal|work] [dir]'
+    set -l profiles_name_personal "Joe Vu"
+    set -l profiles_email_personal "vuthanhdat.dev@gmail.com"
+    set -l profiles_name_work "Dat Ta"
+    set -l profiles_email_work "dat.ta@holidayextras.com"
+
+    set -l profile $argv[1]
+    set -l target_dir (count $argv) -ge 2 && realpath $argv[2] || pwd
+
+    # Re-evaluate correctly
+    if test (count $argv) -ge 2
+        set target_dir (realpath $argv[2])
+    else
+        set target_dir (pwd)
+    end
+
+    switch $profile
+        case personal
+            set name $profiles_name_personal
+            set email $profiles_email_personal
+        case work
+            set name $profiles_name_work
+            set email $profiles_email_work
+        case '*'
+            echo "Usage: gitprofile [personal|work] [dir]"
+            echo "  personal → $profiles_name_personal <$profiles_email_personal>"
+            echo "  work     → $profiles_name_work <$profiles_email_work>"
+            return 1
+    end
+
+    set -l count 0
+    for repo in $target_dir/*/
+        if test -d "$repo/.git"
+            git -C "$repo" config --local user.name "$name"
+            git -C "$repo" config --local user.email "$email"
+            echo "✓ "(basename $repo)" → $name <$email>"
+            set count (math $count + 1)
+        end
+    end
+
+    if test $count -eq 0
+        # Maybe target_dir itself is a repo
+        if test -d "$target_dir/.git"
+            git -C "$target_dir" config --local user.name "$name"
+            git -C "$target_dir" config --local user.email "$email"
+            echo "✓ "(basename $target_dir)" → $name <$email>"
+            set count 1
+        else
+            echo "⚠ No git repos found in: $target_dir"
+            return 1
+        end
+    end
+
+    echo ""
+    echo "✓ Done — $count repo(s) switched to $profile profile"
+end
+
+function gcp --description 'Cherry-pick a commit onto a new branch: gcp <commit> <new-branch> <base-branch>'
+    if test (count $argv) -lt 3
+        echo "Usage: gcp <commit> <new-branch> <base-branch>"
+        echo ""
+        echo "Example:"
+        echo "  gcp 32a1a189 feat/CU-869c8bx1r-s112 develop-s112"
+        echo ""
+        echo "  → checkout develop-s112"
+        echo "  → pull origin develop-s112"
+        echo "  → create branch feat/CU-869c8bx1r-s112"
+        echo "  → cherry-pick <commit>"
+        echo "  → git push -f origin feat/CU-869c8bx1r-s112"
+        return 1
+    end
+
+    set -l commit $argv[1]
+    set -l new_branch $argv[2]
+    set -l base_branch $argv[3]
+
+    echo "→ Fetching to base branch: $base_branch"
+    git fetch -p; or return 1
+
+    echo "→ Switching to base branch: $base_branch"
+    git checkout $base_branch; or return 1
+
+    echo "→ Pulling latest: $base_branch"
+    git pull origin $base_branch; or return 1
+
+    echo "→ Creating new branch: $new_branch"
+    git cobd $new_branch; or return 1
+
+    echo "→ Cherry-picking: $commit"
+    git cherry-pick $commit; or return 1
+
+    echo "→ Force pushing: $new_branch"
+    git push -f origin $new_branch; or return 1
+
+    echo ""
+    echo "✓ Done — $commit cherry-picked onto $new_branch (based on $base_branch)"
+end
+
+# GitHub credential switcher
+function ghswitch --description 'Switch between personal and work GitHub credentials: ghswitch [personal|work]'
+    set -l personal_key ~/.ssh/id_ed25519
+    set -l work_key ~/.ssh/id_ed25519_work
+
+    # Detect current active identity
+    function __ghswitch_current
+        set -l current (ssh -T git@github.com -i $personal_key 2>&1 | string match -r 'Hi (\S+)!')
+        if test -n "$current"
+            echo "personal ($current)"
+            return
+        end
+        set -l current (ssh -T git@github.com -i $work_key 2>&1 | string match -r 'Hi (\S+)!')
+        if test -n "$current"
+            echo "work ($current)"
+        end
+    end
+
+    if test (count $argv) -eq 0
+        # Show current active identity for both
+        set -l personal_user (ssh -T git@github-personal 2>&1 | string match -rg 'Hi (\S+)!')
+        set -l work_user (ssh -T git@github-work 2>&1 | string match -rg 'Hi (\S+)!')
+        echo "Available GitHub credentials:"
+        echo "  personal → $personal_user (key: $personal_key)"
+        echo "  work     → $work_user (key: $work_key)"
+
+        # Show which insteadOf is currently active
+        set -l current_rewrite (git config --global --get url.git@github-work:holidayextras/.insteadof 2>/dev/null)
+        if test -n "$current_rewrite"
+            echo ""
+            echo "Active git URL rewrite: github.com/holidayextras → github-work (dat-ta-hx / work)"
+        else
+            echo ""
+            echo "Active git URL rewrite: none (using default github.com)"
+        end
+        return
+    end
+
+    switch $argv[1]
+        case personal
+            # Remove work rewrite rules
+            git config --global --unset url.git@github-work:holidayextras/.insteadof "ssh://git@github.com/holidayextras/" 2>/dev/null
+            git config --global --unset url.git@github-work:holidayextras/.insteadof "git@github.com:holidayextras/" 2>/dev/null
+            set -l user (ssh -T git@github-personal 2>&1 | string match -rg 'Hi (\S+)!')
+            echo "✓ Switched to personal GitHub: $user"
+            echo "  Using key: $personal_key"
+
+        case work
+            # Set work rewrite rules
+            git config --global url."git@github-work:holidayextras/".insteadOf "ssh://git@github.com/holidayextras/"
+            git config --global url."git@github-work:holidayextras/".insteadOf "git@github.com:holidayextras/"
+            set -l user (ssh -T git@github-work 2>&1 | string match -rg 'Hi (\S+)!')
+            echo "✓ Switched to work GitHub: $user"
+            echo "  Using key: $work_key"
+
+        case '*'
+            echo "Usage: ghswitch [personal|work]"
+            echo "       ghswitch        → show current status"
+    end
+end
+
